@@ -5,88 +5,40 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 out="${1:-$repo_root/archify.zip}"
-if [[ "$out" != /* ]]; then
-  out="$(pwd)/$out"
-fi
+
+# Reject unsafe raw output spellings before the canonical-toolchain gate so
+# every maintained Node lane exercises the same shared native path grammar.
+# This validation-only mode is read-only and does not create parent paths.
+node "$repo_root/scripts/write-deterministic-zip.mjs" --validate-output "$out"
 
 # Runtime consumers support every Node version declared by archify/package.json,
 # but canonical ZIP bytes depend on the Node/zlib toolchain. CI and releases use
-# Node 22, so fail clearly instead of publishing different bytes from another
-# Node major.
+# official Node 22 with its bundled zlib. Distributions linked against a system
+# zlib can produce different bytes even at the same Node version.
 canonical_node_major=22
+canonical_zlib_version=1.3.1-e00f703
 node_version="$(node -p 'process.versions.node')"
 node_major="${node_version%%.*}"
-if [[ "$node_major" != "$canonical_node_major" ]]; then
-  echo "canonical archify.zip builds require Node $canonical_node_major (current: $node_version)" >&2
+zlib_version="$(node -p 'process.versions.zlib')"
+if [[ "$node_major" != "$canonical_node_major" || "$zlib_version" != "$canonical_zlib_version" ]]; then
+  echo "canonical archify.zip builds require Node $canonical_node_major with bundled zlib $canonical_zlib_version (current: Node $node_version, zlib $zlib_version)" >&2
+  echo "Use an official Node.js 22 distribution with the required bundled zlib on PATH; diagram runtime support is unchanged." >&2
   exit 1
 fi
 
-# Stage only files tracked by Git. Paths and modes come from the index, while
-# bytes intentionally come from the working tree so contributors can package
-# tracked edits before committing them. A conflicted index is never publishable.
-# Rejecting tracked paths that are symlinks prevents an archive build from
-# reading through links to content outside the repository.
-# test/ is repo-only (the golden harness compares against ../examples at the
-# repo root, which does not exist in an installed skill). The npm scripts and
-# build-only dependencies are stripped from the shipped package.json. Runtime
-# schema validation is provided by the committed standalone validators, so
-# installing the skill never requires npm install.
+# The shared stager owns tracked-only selection, index modes, conflict and
+# symlink rejection, repository-only exclusions, and package.json cleanup for
+# both the ZIP and DeepSeek Harness tarball.
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
-if [[ ! -f "$repo_root/archify/renderers/shared/generated-validators.mjs" ]]; then
-  echo 'generated validators are missing — run npm run generate:validators in archify/' >&2
-  exit 1
-fi
-while IFS= read -r -d '' record; do
-  metadata="${record%%$'\t'*}"
-  tracked="${record#*$'\t'}"
-  tracked_mode="${metadata%% *}"
-  tracked_stage="${metadata##* }"
-  if [[ "$tracked_stage" != 0 ]]; then
-    echo "refusing to package unmerged index entry (stage $tracked_stage): $tracked" >&2
-    exit 1
-  fi
-  case "$tracked" in
-    archify/test | archify/test/* | \
-    archify/package-lock.json | \
-    archify/scripts/generate-brand-marks.mjs | \
-    archify/scripts/generate-validators.mjs)
-      continue
-      ;;
-  esac
+node "$repo_root/scripts/stage-clean-skill.mjs" \
+  --root "$repo_root" \
+  --dest "$stage/archify" \
+  --mode-manifest "$stage/modes.json" >/dev/null
 
-  source="$repo_root/$tracked"
-  if [[ -L "$source" ]]; then
-    echo "refusing to package tracked symlink: $tracked" >&2
-    exit 1
-  fi
-  if [[ ! -f "$source" ]]; then
-    echo "tracked package input is missing or not a regular file: $tracked" >&2
-    exit 1
-  fi
-
-  target="$stage/$tracked"
-  mkdir -p "$(dirname "$target")"
-  cp "$source" "$target"
-  case "$tracked_mode" in
-    100755) chmod 0755 "$target" ;;
-    100644) chmod 0644 "$target" ;;
-    *)
-      echo "unsupported tracked package mode $tracked_mode: $tracked" >&2
-      exit 1
-      ;;
-  esac
-done < <(git -C "$repo_root" ls-files --stage -z -- archify)
-node -e "
-  const fs = require('fs');
-  const p = '$stage/archify/package.json';
-  const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
-  delete pkg.scripts;
-  delete pkg.devDependencies;
-  fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + '\n');
-"
-rm -f "$stage/archify/package-lock.json"
-
-node "$repo_root/scripts/write-deterministic-zip.mjs" "$stage/archify" "$out"
+# Entry modes come from the recorded Git index modes, not from stat(), so the
+# archive bytes do not depend on the building platform's permission support.
+node "$repo_root/scripts/write-deterministic-zip.mjs" "$stage/archify" "$out" \
+  --mode-manifest "$stage/modes.json"
 
 echo "built $out"
